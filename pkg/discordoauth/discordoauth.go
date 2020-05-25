@@ -1,164 +1,138 @@
 package discordoauth
 
 import (
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-
-	"github.com/zekroTJA/yuri2/internal/static"
+	"strings"
 )
 
-// OnErrorFunc is the function to be used to handle errors during
-// authentication.
-type OnErrorFunc func(w http.ResponseWriter, r *http.Request, status int, msg string)
+const (
+	endpointDiscordOauth = "https://discordapp.com/api/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s"
+	endpointDiscordToken = "https://discordapp.com/api/oauth2/token"
+	endpointDiscordMe    = "https://discordapp.com/api/users/@me"
+)
 
-// OnSuccessFuc is the func to be used to handle the successful
-// authentication.
-type OnSuccessFuc func(w http.ResponseWriter, r *http.Request, userID string)
+var (
+	errUnauthorized = errors.New("unauthorized")
+)
 
-// DiscordOAuth provides http handlers for
-// authenticating a discord User by your Discord
-// OAuth application.
-type DiscordOAuth struct {
-	clientID     string
+type DiscordOauth struct {
+	clientId     string
 	clientSecret string
-	redirectURI  string
+	redirectUri  string
+	scopes       []string
 
-	onError   OnErrorFunc
-	onSuccess OnSuccessFuc
+	authUri string
 }
 
-type oAuthTokenResponse struct {
-	Error       string `json:"error"`
-	AccessToken string `json:"access_token"`
-}
-
-type getUserMeResponse struct {
-	Error string `json:"error"`
-	ID    string `json:"id"`
-}
-
-// NewDiscordOAuth returns a new instance of DiscordOAuth.
-func NewDiscordOAuth(clientID, clientSecret, redirectURI string, onError OnErrorFunc, onSuccess OnSuccessFuc) *DiscordOAuth {
-	if onError == nil {
-		onError = func(w http.ResponseWriter, r *http.Request, status int, msg string) {}
-	}
-	if onSuccess == nil {
-		onSuccess = func(w http.ResponseWriter, r *http.Request, userID string) {}
-	}
-
-	return &DiscordOAuth{
-		clientID:     clientID,
+func New(clientId, clientSecret, redirectUri string, scopes ...string) *DiscordOauth {
+	d := &DiscordOauth{
+		clientId:     clientId,
 		clientSecret: clientSecret,
-		redirectURI:  redirectURI,
-
-		onError:   onError,
-		onSuccess: onSuccess,
+		redirectUri:  redirectUri,
+		scopes:       scopes,
 	}
+
+	if len(d.scopes) == 0 {
+		d.scopes = append(d.scopes, "identify")
+	}
+
+	d.authUri = fmt.Sprintf(
+		endpointDiscordOauth, clientId,
+		url.QueryEscape(redirectUri),
+		strings.Join(d.scopes, "%20"))
+
+	return d
 }
 
-// HandlerInit returns a redirect response to the OAuth Apps
-// authentication page.
-func (d *DiscordOAuth) HandlerInit(w http.ResponseWriter, r *http.Request) {
-	uri := fmt.Sprintf("https://discordapp.com/api/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=identify",
-		d.clientID, url.QueryEscape(d.redirectURI))
-	w.Header().Set("Location", uri)
+func (d *DiscordOauth) HandleInitialize(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Location", d.authUri)
 	w.WriteHeader(http.StatusTemporaryRedirect)
 }
 
-// HandlerCallback will be requested by discordapp.com on successful
-// app authentication. This handler will check the validity of the passed
-// authorization code by getting a bearer token and trying to get self
-// user data by requesting them using the bearer token.
-// If this fails, onError will be called. Else, onSuccess will be
-// called passing the userID of the user authenticated.
-func (d *DiscordOAuth) HandlerCallback(w http.ResponseWriter, r *http.Request) {
+func (d *DiscordOauth) HandleCallback(w http.ResponseWriter, r *http.Request) (*UserModel, error) {
 	code := r.URL.Query().Get("code")
 
-	// 1. Request getting bearer token by app auth code
+	token, err := d.getAuthToken(code)
+	if err != nil {
+		return nil, err
+	}
 
-	data := map[string][]string{
-		"client_id":     []string{d.clientID},
+	user, err := d.validateToken(token)
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+func (d *DiscordOauth) IsErrUnauthorized(err error) bool {
+	return err == errUnauthorized
+}
+
+func (d *DiscordOauth) getAuthToken(code string) (string, error) {
+	values := url.Values{
+		"client_id":     []string{d.clientId},
 		"client_secret": []string{d.clientSecret},
 		"grant_type":    []string{"authorization_code"},
 		"code":          []string{code},
-		"redirect_uri":  []string{d.redirectURI},
-		"scope":         []string{"identify"},
+		"redirect_uri":  []string{d.redirectUri},
+		"scope":         d.scopes,
 	}
 
-	values := url.Values(data)
-	req, err := http.NewRequest("POST", static.URLDiscordAPIOAuthToken,
-		bytes.NewBuffer([]byte(values.Encode())))
+	res, err := http.PostForm(endpointDiscordToken, values)
 	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed creating request: "+err.Error())
-		return
+		return "", err
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if res.StatusCode == http.StatusUnauthorized {
+		return "", errUnauthorized
+	}
+
+	if res.StatusCode >= 400 {
+		return "", fmt.Errorf("response code %d", res.StatusCode)
+	}
+
+	tokenResp := new(authTokenModel)
+	if err = json.NewDecoder(res.Body).Decode(tokenResp); err != nil {
+		return "", err
+	}
+
+	if tokenResp.Error != "" {
+		return "", errors.New(tokenResp.Error)
+	}
+
+	return tokenResp.AccessToken, nil
+}
+
+func (d *DiscordOauth) validateToken(token string) (*UserModel, error) {
+	req, _ := http.NewRequest("GET", endpointDiscordMe, nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed executing request: "+err.Error())
-		return
+		return nil, err
 	}
 
-	if res.StatusCode >= 300 {
-		d.onError(w, r, http.StatusUnauthorized, "")
-		return
+	if res.StatusCode == http.StatusUnauthorized {
+		return nil, errUnauthorized
 	}
 
-	resAuthBody := new(oAuthTokenResponse)
-	err = parseJSONBody(res.Body, resAuthBody)
-	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed parsing Discord API response: "+err.Error())
-		return
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("response code %d", res.StatusCode)
 	}
 
-	if resAuthBody.Error != "" || resAuthBody.AccessToken == "" {
-		d.onError(w, r, http.StatusUnauthorized, "")
-		return
+	userRes := new(UserModel)
+	if err = json.NewDecoder(res.Body).Decode(userRes); err != nil {
+		return nil, err
 	}
 
-	// 2. Request getting user ID
-
-	req, err = http.NewRequest("GET", static.URLDiscordGetUserMe, nil)
-	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed creating request: "+err.Error())
-		return
+	if userRes.Error != "" {
+		return nil, errors.New(userRes.Error)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+resAuthBody.AccessToken)
-
-	res, err = http.DefaultClient.Do(req)
-	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed executing request: "+err.Error())
-		return
-	}
-
-	if res.StatusCode >= 300 {
-		d.onError(w, r, http.StatusUnauthorized, "")
-		return
-	}
-
-	resGetMe := new(getUserMeResponse)
-	err = parseJSONBody(res.Body, resGetMe)
-	if err != nil {
-		d.onError(w, r, http.StatusInternalServerError, "failed parsing Discord API response: "+err.Error())
-		return
-	}
-
-	if resGetMe.Error != "" || resGetMe.ID == "" {
-		d.onError(w, r, http.StatusUnauthorized, "")
-		return
-	}
-
-	d.onSuccess(w, r, resGetMe.ID)
-}
-
-func parseJSONBody(body io.ReadCloser, v interface{}) error {
-	dec := json.NewDecoder(body)
-	return dec.Decode(v)
+	return userRes, nil
 }
